@@ -2,28 +2,58 @@
  * Pi Search Extension
  *
  * Adds web_search and web_fetch tools to pi.
- * Uses the current provider's native web search API when available
- * (ZAI, Google, OpenAI, xAI, Anthropic), falls back to DuckDuckGo otherwise.
- * ZAI search uses the Web Search Prime MCP endpoint (included in
- * Coding Plans) rather than the separate paid Web Search API.
+ *
+ * Search routing is independent of the conversation provider. Targets are
+ * considered in order: a globally configured backend, the active conversation
+ * LLM model when its provider has an implemented search backend, authenticated
+ * non-LLM backends (ZAI MCP), then DuckDuckGo. Each attempt is target-scoped:
+ * the selected backend's own credentials and endpoints are used, never the
+ * conversation provider's.
+ *
+ * web_fetch always uses one direct HTTP implementation, regardless of the
+ * conversation provider or the configured search backend.
  *
  * Usage:
- *   /search          - Toggle search tools on/off (only shows configured providers)
- *   /search providers - Show ALL providers and their capabilities
- *   /search config    - Show current config
- *   /search on|off    - Quick toggle
+ *   /search            - Configure global switches, backend, and model
+ *   /search providers  - Show implemented search backends and readiness
+ *   /search config     - Show session, planned target, and fallback chain
+ *   /search on|off     - Quick global toggle
  *
  * Config persists in ~/.pi/agent/search-config.json
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { chatgptSearch } from "./chatgpt-search.ts";
 import { formatSearchResult, parseAnthropicSearch, parseGoogleSearch, parseResponsesSearch, type SearchResult } from "./search-result.ts";
-import { resolveSearchModel, describeSearchModel, type SearchModelSelection } from "./search-model.ts";
+import {
+  loadSearchConfig,
+  saveSearchConfig,
+  searchBlocked,
+  fetchBlocked,
+  type ConfigState,
+  type SearchConfig,
+} from "./search-config.ts";
+import {
+  planSearchTargets,
+  describeTarget,
+  type AuthReadiness,
+  type RoutingModel,
+  type SearchPlan,
+  type SearchTarget,
+  type SkipDiagnostic,
+  type TargetTier,
+} from "./search-routing.ts";
+import {
+  SEARCH_BACKENDS,
+  SEARCH_BACKEND_IDS,
+  backendName,
+  isLlmBackend,
+  type SearchBackendId,
+} from "./search-providers.ts";
 import {
   getAgentDir,
   truncateHead,
@@ -41,190 +71,17 @@ import {
 } from "@earendil-works/pi-tui";
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 
-interface SearchConfig {
-  enabled: boolean;
-  searchEnabled: boolean;
-  fetchEnabled: boolean;
-  providerOverrides: Record<
-    string,
-    { searchEnabled?: boolean; fetchEnabled?: boolean; model?: string }
-  >;
-}
+const AUTOMATIC = "automatic";
+const MAX_REASON_BYTES = 200;
+const MAX_ATTEMPT_HISTORY = 8;
+const MAX_VISIBLE_ITEMS = 16;
 
-const PROVIDERS: Record<
-  string,
-  {
-    name: string;
-    nativeSearch: boolean;
-    nativeFetch: boolean;
-    envKey: string;
-  }
-> = {
-  zai: {
-    name: "ZAI (GLM)",
-    nativeSearch: true,
-    nativeFetch: true,
-    envKey: "ZAI_API_KEY",
-  },
-  google: {
-    name: "Google Gemini",
-    nativeSearch: true,
-    nativeFetch: false,
-    envKey: "GEMINI_API_KEY",
-  },
-  openai: {
-    name: "OpenAI",
-    nativeSearch: true,
-    nativeFetch: false,
-    envKey: "OPENAI_API_KEY",
-  },
-  "openai-codex": {
-    name: "OpenAI ChatGPT (subscription)",
-    nativeSearch: true,
-    nativeFetch: false,
-    envKey: "", // OAuth is resolved/refreshed by Pi, not OPENAI_API_KEY.
-  },
-  xai: {
-    name: "xAI (Grok)",
-    nativeSearch: true,
-    nativeFetch: false,
-    envKey: "XAI_API_KEY",
-  },
-  anthropic: {
-    name: "Anthropic",
-    nativeSearch: true,
-    nativeFetch: false,
-    envKey: "ANTHROPIC_API_KEY",
-  },
-  "claude-bridge": {
-    name: "Claude Code (subscription)",
-    nativeSearch: true,
-    nativeFetch: true,
-    envKey: "",
-  },
-  openrouter: {
-    name: "OpenRouter",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "OPENROUTER_API_KEY",
-  },
-  deepseek: {
-    name: "DeepSeek",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "DEEPSEEK_API_KEY",
-  },
-  mistral: {
-    name: "Mistral",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "MISTRAL_API_KEY",
-  },
-  groq: {
-    name: "Groq",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "GROQ_API_KEY",
-  },
-  cerebras: {
-    name: "Cerebras",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "CEREBRAS_API_KEY",
-  },
-  huggingface: {
-    name: "Hugging Face",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "HF_TOKEN",
-  },
-  fireworks: {
-    name: "Fireworks",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "FIREWORKS_API_KEY",
-  },
-  cloudflare: {
-    name: "Cloudflare",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "",
-  },
-  "amazon-bedrock": {
-    name: "Amazon Bedrock",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "",
-  },
-  "azure-openai": {
-    name: "Azure OpenAI",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "",
-  },
-  kimi: {
-    name: "Kimi",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "KIMI_API_KEY",
-  },
-  minimax: {
-    name: "MiniMax",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "MINIMAX_API_KEY",
-  },
-  "github-copilot": {
-    name: "GitHub Copilot",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "",
-  },
-  vercel: {
-    name: "Vercel AI Gateway",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "AI_GATEWAY_API_KEY",
-  },
-  opencode: {
-    name: "OpenCode",
-    nativeSearch: false,
-    nativeFetch: false,
-    envKey: "OPENCODE_API_KEY",
-  },
-};
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-
-function getConfigPath() {
-  return join(getAgentDir(), "search-config.json");
-}
-
-function loadConfig(): SearchConfig {
-  try {
-    const path = getConfigPath();
-    if (existsSync(path)) return JSON.parse(readFileSync(path, "utf-8"));
-  } catch {}
-  return {
-    enabled: true,
-    searchEnabled: true,
-    fetchEnabled: true,
-    providerOverrides: {},
-  };
-}
-
-function saveConfig(config: SearchConfig) {
-  const dir = getAgentDir();
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), "utf-8");
-}
-
-// ─── API Key ──────────────────────────────────────────────────────────────────
+// ─── Credentials ─────────────────────────────────────────────────────────────
 
 function getApiKey(provider: string): string | undefined {
-  const cap = PROVIDERS[provider];
-  if (!cap?.envKey) return undefined;
-  const key = process.env[cap.envKey];
+  const backend = SEARCH_BACKENDS[provider as SearchBackendId];
+  if (!backend?.envKey) return undefined;
+  const key = process.env[backend.envKey];
   if (key) return key;
   try {
     const authPath = join(getAgentDir(), "auth.json");
@@ -237,26 +94,113 @@ function getApiKey(provider: string): string | undefined {
   return undefined;
 }
 
-/** Check if a provider has credentials configured */
-function hasCredentials(provider: string, ctx: ExtensionContext): boolean {
-  if (provider === "openai-codex") {
-    const model = ctx.model?.provider === provider
-      ? ctx.model
-      : ctx.modelRegistry.getAll().find((m) => m.provider === provider);
-    return !!model && ctx.modelRegistry.hasConfiguredAuth(model);
-  }
-  // claude-bridge uses the `claude` CLI's own subscription auth — assume it's
-  // available if the user has selected this provider in pi.
-  if (provider === "claude-bridge") return true;
-  if (getApiKey(provider)) return true;
+/** Pi-managed OAuth credentials are stored in auth.json, not this config. */
+function hasOAuthEntry(provider: string): boolean {
   try {
     const authPath = join(getAgentDir(), "auth.json");
-    if (existsSync(authPath)) {
-      const entry = JSON.parse(readFileSync(authPath, "utf-8"))[provider];
-      if (entry?.type === "oauth" && entry.refresh) return true;
+    if (!existsSync(authPath)) return false;
+    const entry = JSON.parse(readFileSync(authPath, "utf-8"))[provider];
+    return entry?.type === "oauth" && !!entry.refresh;
+  } catch {
+    return false;
+  }
+}
+
+interface RegisteredModel extends RoutingModel {
+  name?: string;
+}
+
+function registeredModels(backend: SearchBackendId, ctx: ExtensionContext): RegisteredModel[] {
+  const all = ctx.modelRegistry?.getAll?.() ?? [];
+  return all
+    .filter((model) => model.provider === backend)
+    .map((model) => ({
+      provider: model.provider,
+      id: model.id,
+      ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
+      ...(model.name ? { name: model.name } : {}),
+    }));
+}
+
+function resolveRegisteredModel(target: SearchTarget, ctx: ExtensionContext) {
+  const model = target.model;
+  if (!model) return undefined;
+  if (ctx.model?.provider === target.backend && ctx.model.id === model.id) return ctx.model;
+  return ctx.modelRegistry?.find?.(target.backend, model.id);
+}
+
+/**
+ * Credential readiness for a candidate. Codex readiness is evaluated for the
+ * selected registered model; Claude Bridge has no reliable synchronous probe,
+ * so its readiness is deferred until the SDK is actually invoked.
+ */
+function backendReadiness(
+  backend: SearchBackendId,
+  model: RoutingModel | undefined,
+  ctx: ExtensionContext,
+): AuthReadiness {
+  switch (SEARCH_BACKENDS[backend].auth) {
+    case "none":
+      return "ready";
+    case "cli-subscription":
+      return "deferred";
+    case "pi-oauth": {
+      const resolved =
+        model && ctx.model?.provider === backend && ctx.model.id === model.id
+          ? ctx.model
+          : model
+            ? ctx.modelRegistry?.find?.(backend, model.id)
+            : undefined;
+      if (!resolved) return "missing";
+      return ctx.modelRegistry?.hasConfiguredAuth?.(resolved) ? "ready" : "missing";
     }
-  } catch {}
-  return false;
+    case "api-key":
+      return getApiKey(backend) || hasOAuthEntry(backend) ? "ready" : "missing";
+  }
+}
+
+/** Readiness used for provider listings, without a specific model selected. */
+function overviewReadiness(backend: SearchBackendId, ctx: ExtensionContext): AuthReadiness {
+  if (SEARCH_BACKENDS[backend].auth === "pi-oauth") {
+    const models = registeredModels(backend, ctx);
+    return models.some((model) => backendReadiness(backend, model, ctx) === "ready")
+      ? "ready"
+      : "missing";
+  }
+  return backendReadiness(backend, undefined, ctx);
+}
+
+function readinessLabel(readiness: AuthReadiness): string {
+  switch (readiness) {
+    case "ready":
+      return "ready";
+    case "missing":
+      return "not configured";
+    case "deferred":
+      return "checked at call time";
+  }
+}
+
+// ─── Planning ────────────────────────────────────────────────────────────────
+
+function planFor(ctx: ExtensionContext, config: SearchConfig): SearchPlan {
+  const models: Partial<Record<string, RoutingModel[]>> = {};
+  for (const backend of SEARCH_BACKEND_IDS) {
+    if (SEARCH_BACKENDS[backend].kind === "llm") models[backend] = registeredModels(backend, ctx);
+  }
+  const sessionModel: RoutingModel | undefined = ctx.model
+    ? {
+        provider: ctx.model.provider,
+        id: ctx.model.id,
+        ...(ctx.model.baseUrl ? { baseUrl: ctx.model.baseUrl } : {}),
+      }
+    : undefined;
+  return planSearchTargets({
+    config,
+    sessionModel,
+    models,
+    readiness: (backend, model) => backendReadiness(backend, model, ctx),
+  });
 }
 
 // ─── ZAI MCP Web Search ──────────────────────────────────────────────────────
@@ -287,10 +231,12 @@ async function mcpInit(apiKey: string, signal?: AbortSignal): Promise<McpSession
       },
     }),
   });
-  if (!res.ok)
-    throw new Error(`ZAI MCP init ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`ZAI MCP initialize failed (HTTP ${res.status}).`);
+  }
   const sessionId = res.headers.get("Mcp-Session-Id");
-  if (!sessionId) throw new Error("ZAI MCP: no session ID returned");
+  if (!sessionId) throw new Error("ZAI MCP returned no session ID.");
   return { sessionId };
 }
 
@@ -313,20 +259,18 @@ async function mcpCall<T = any>(
     },
     body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
   });
-  if (!res.ok)
-    throw new Error(
-      `ZAI MCP ${method} ${res.status}: ${(await res.text()).slice(0, 200)}`,
-    );
-  const text = await res.text();
-  const lines = text.split("\n");
-  for (const line of lines) {
-    if (line.startsWith("data:")) {
-      const json = JSON.parse(line.slice(5).trim());
-      if (json.error) throw new Error(`ZAI MCP: ${json.error.message}`);
-      return json.result as T;
-    }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`ZAI MCP ${method} failed (HTTP ${res.status}).`);
   }
-  throw new Error("ZAI MCP: no data in response");
+  const text = await res.text();
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data:")) continue;
+    const json = JSON.parse(line.slice(5).trim());
+    if (json.error) throw new Error(`ZAI MCP returned an error: ${json.error.message}`);
+    return json.result as T;
+  }
+  throw new Error("ZAI MCP returned no data.");
 }
 
 async function zaiSearch(
@@ -406,8 +350,10 @@ async function anthropicSearch(
       tools: [{ type: "web_search_20250305", name: "web_search" }],
     }),
   });
-  if (!res.ok)
-    throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Anthropic search failed (HTTP ${res.status}).`);
+  }
   const data = (await res.json()) as any;
 
   return parseAnthropicSearch(data);
@@ -433,8 +379,10 @@ async function googleSearch(
       }),
     },
   );
-  if (!res.ok)
-    throw new Error(`Google ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Google search failed (HTTP ${res.status}).`);
+  }
   const data = (await res.json()) as any;
   return parseGoogleSearch(data);
 }
@@ -456,8 +404,10 @@ async function openaiSearch(
       input: query,
     }),
   });
-  if (!res.ok)
-    throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`OpenAI search failed (HTTP ${res.status}).`);
+  }
   const data = (await res.json()) as any;
   return parseResponsesSearch(data.output, { searchSources: true });
 }
@@ -478,8 +428,10 @@ async function xaiSearch(
       input: query,
     }),
   });
-  if (!res.ok)
-    throw new Error(`xAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`xAI search failed (HTTP ${res.status}).`);
+  }
   const data = (await res.json()) as any;
   return parseResponsesSearch(data.output, { citations: data.citations, numericTitles: true });
 }
@@ -568,76 +520,29 @@ async function claudeBridgeSearch(
   signal?.addEventListener("abort", onAbort, { once: true });
 
   let responseText = "";
+  let failure: string | undefined;
   try {
     for await (const message of sdkQuery) {
-      if (signal?.aborted) break;
-      if (
-        message.type === "result" &&
-        message.subtype === "success" &&
-        message.result
-      ) {
-        responseText = message.result;
+      signal?.throwIfAborted();
+      if (message.type !== "result") continue;
+      if (message.subtype === "success") {
+        if (typeof message.result === "string" && message.result.trim()) {
+          responseText = message.result;
+        }
+      } else {
+        // Unsuccessful SDK termination is an error, never an empty success.
+        failure = `Claude Bridge search failed (${message.subtype ?? "error"}).`;
       }
     }
-    return responseText || "No results found.";
   } finally {
     signal?.removeEventListener("abort", onAbort);
     try {
       sdkQuery.close();
     } catch {}
   }
-}
-
-async function claudeBridgeFetch(
-  url: string,
-  signal?: AbortSignal,
-): Promise<string> {
-  const sdk = await loadClaudeAgentSdk();
-  const sdkQuery = sdk.query({
-    prompt:
-      `Fetch this URL: ${url}\n\n` +
-      "Use the WebFetch tool. Return the page's main content as plain " +
-      "text or markdown. Do not summarise. Do not add commentary.",
-    options: {
-      cwd: process.cwd(),
-      permissionMode: "bypassPermissions",
-      allowedTools: ["WebFetch"],
-      systemPrompt: { type: "preset", preset: "claude_code" },
-      settingSources: [],
-    },
-  });
-
-  const onAbort = () => {
-    sdkQuery.interrupt().catch(() => {});
-    try {
-      sdkQuery.close();
-    } catch {}
-  };
-  if (signal?.aborted) {
-    onAbort();
-    throw new Error("Aborted");
-  }
-  signal?.addEventListener("abort", onAbort, { once: true });
-
-  let responseText = "";
-  try {
-    for await (const message of sdkQuery) {
-      if (signal?.aborted) break;
-      if (
-        message.type === "result" &&
-        message.subtype === "success" &&
-        message.result
-      ) {
-        responseText = message.result;
-      }
-    }
-    return responseText || "No content returned.";
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
-    try {
-      sdkQuery.close();
-    } catch {}
-  }
+  if (signal?.aborted) signal.throwIfAborted();
+  if (responseText) return responseText;
+  throw new Error(failure ?? "Claude Bridge search returned no content.");
 }
 
 // ─── DuckDuckGo Fallback ─────────────────────────────────────────────────────
@@ -661,7 +566,10 @@ async function ddgSearch(query: string, signal?: AbortSignal): Promise<string> {
       headers: { "User-Agent": "Mozilla/5.0 (compatible; PiSearch/1.0)" },
     },
   );
-  if (!res.ok) throw new Error(`DuckDuckGo ${res.status}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`DuckDuckGo search failed (HTTP ${res.status}).`);
+  }
   const html = await res.text();
   const titles: { url: string; title: string }[] = [];
   const snippets: string[] = [];
@@ -685,6 +593,8 @@ async function ddgSearch(query: string, signal?: AbortSignal): Promise<string> {
 }
 
 // ─── Web Fetch ────────────────────────────────────────────────────────────────
+// One direct HTTP implementation for every conversation provider and search
+// backend. It resolves no search credentials and never invokes an LLM.
 
 async function httpFetch(url: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch(url, {
@@ -694,7 +604,10 @@ async function httpFetch(url: string, signal?: AbortSignal): Promise<string> {
       Accept: "text/html,text/plain,application/json",
     },
   });
-  if (!res.ok) throw new Error(`Fetch ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`Fetch ${res.status} ${res.statusText}`);
+  }
   const ct = res.headers.get("content-type") || "";
   let text = ct.includes("application/json")
     ? JSON.stringify(await res.json(), null, 2)
@@ -706,107 +619,209 @@ async function httpFetch(url: string, signal?: AbortSignal): Promise<string> {
       .replace(/<[^>]+>/g, " ")
       .replace(/\s+/g, " ")
       .trim();
-  const t = truncateHead(text, {
+  const first = truncateHead(text, {
     maxLines: DEFAULT_MAX_LINES,
     maxBytes: DEFAULT_MAX_BYTES,
   });
-  return (
-    t.content +
-    (t.truncated ? `\n\n[Truncated: ${t.outputLines}/${t.totalLines} lines]` : "")
-  );
+  if (!first.truncated) return text;
+  // Reserve room for the notice so total output stays inside the documented limits.
+  const notice = `\n\n[Truncated: ${first.outputLines}/${first.totalLines} lines]`;
+  const bounded = truncateHead(text, {
+    maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice),
+    maxLines: DEFAULT_MAX_LINES - (notice.split("\n").length - 1),
+  });
+  return bounded.content + notice;
 }
 
-// ─── Dispatcher ───────────────────────────────────────────────────────────────
+// ─── Target-scoped dispatch ──────────────────────────────────────────────────
 
-async function doSearch(
+function requireApiKey(backend: SearchBackendId): string {
+  const key = getApiKey(backend);
+  if (!key) throw new Error(`${backendName(backend)} credentials are not configured.`);
+  return key;
+}
+
+function requireModelId(target: SearchTarget): string {
+  const id = target.model?.id;
+  if (!id) throw new Error(`No model is selected for ${target.backend}.`);
+  return id;
+}
+
+/**
+ * Perform exactly one attempt for one target. Adapters throw on failure and
+ * never choose a fallback themselves. Every request input is derived from the
+ * target, never from the unrelated conversation provider.
+ */
+async function attemptSearch(
   query: string,
-  provider: string,
-  selection: SearchModelSelection,
-  baseUrl: string,
+  target: SearchTarget,
   ctx: ExtensionContext,
   signal?: AbortSignal,
-): Promise<SearchResult & { nativeError?: string }> {
+): Promise<SearchResult> {
   signal?.throwIfAborted();
-  const model = selection.id ?? "";
-  const apiKey = getApiKey(provider);
-  if (canUseNativeSearch(provider)) {
-    try {
-      switch (provider) {
-        case "zai":
-          return { text: await zaiSearch(query, apiKey!, signal), sources: [] };
-        case "google":
-          return await googleSearch(query, model, apiKey!, signal);
-        case "openai":
-          return await openaiSearch(query, model, apiKey!, signal);
-        case "openai-codex": {
-          const searchModel = selection.source === "configured"
-            ? ctx.modelRegistry.find(provider, model)
-            : ctx.model;
-          if (!searchModel) throw new Error(`Search model not registered: ${provider}/${model}`);
-          return await chatgptSearch(query, ctx, signal, undefined, searchModel);
-        }
-        case "xai":
-          return await xaiSearch(query, model, apiKey!, signal);
-        case "anthropic":
-          return await anthropicSearch(query, model, apiKey!, baseUrl, signal);
-        case "claude-bridge":
-          return { text: await claudeBridgeSearch(query, signal, selection.id), sources: [] };
+  switch (target.backend) {
+    case "zai": {
+      const apiKey = requireApiKey("zai");
+      signal?.throwIfAborted();
+      return { text: await zaiSearch(query, apiKey, signal), sources: [] };
+    }
+    case "duckduckgo":
+      return { text: await ddgSearch(query, signal), sources: [] };
+    case "google": {
+      const apiKey = requireApiKey("google");
+      signal?.throwIfAborted();
+      return googleSearch(query, requireModelId(target), apiKey, signal);
+    }
+    case "openai": {
+      const apiKey = requireApiKey("openai");
+      signal?.throwIfAborted();
+      return openaiSearch(query, requireModelId(target), apiKey, signal);
+    }
+    case "xai": {
+      const apiKey = requireApiKey("xai");
+      signal?.throwIfAborted();
+      return xaiSearch(query, requireModelId(target), apiKey, signal);
+    }
+    case "anthropic": {
+      const apiKey = requireApiKey("anthropic");
+      signal?.throwIfAborted();
+      // Base URL belongs to the selected target model, not the session model.
+      return anthropicSearch(
+        query,
+        requireModelId(target),
+        apiKey,
+        target.model?.baseUrl ?? "",
+        signal,
+      );
+    }
+    case "openai-codex": {
+      const model = resolveRegisteredModel(target, ctx);
+      if (!model) {
+        throw new Error(
+          `Search model is not registered: ${target.backend}/${target.model?.id ?? "?"}.`,
+        );
       }
-    } catch (err: any) {
-      signal?.throwIfAborted(); // Cancellation must not start a fallback request.
-      return { text: await ddgSearch(query, signal), sources: [], nativeError: err.message };
+      signal?.throwIfAborted();
+      return chatgptSearch(query, ctx, signal, undefined, model);
+    }
+    case "claude-bridge":
+      signal?.throwIfAborted();
+      return { text: await claudeBridgeSearch(query, signal, target.model?.id), sources: [] };
+  }
+}
+
+// ─── Fallback orchestration ─────────────────────────────────────────────────
+
+export interface AttemptRecord {
+  backend: string;
+  modelId?: string;
+  tier: TargetTier;
+  ok: boolean;
+  reason?: string;
+}
+
+/** Keep tokens, headers, and credential-bearing URLs out of diagnostics. */
+export function sanitizeReason(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw
+    .replace(/\bBearer\s+[^\s,;)]+/gi, "Bearer [redacted]")
+    .replace(/\b(?:sk|pk|rk|api|key)[-_][A-Za-z0-9_-]{8,}/gi, "[redacted]")
+    .replace(/([?&](?:key|api_?key|access_?token|token|password)=)[^&\s]+/gi, "$1[redacted]")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_REASON_BYTES);
+}
+
+async function runSearchChain(
+  query: string,
+  plan: SearchPlan,
+  ctx: ExtensionContext,
+  signal: AbortSignal | undefined,
+  onAttempt?: (target: SearchTarget, index: number) => void,
+): Promise<{ result: SearchResult; target: SearchTarget; attempts: AttemptRecord[] }> {
+  const attempts: AttemptRecord[] = [];
+  for (let index = 0; index < plan.candidates.length; index++) {
+    const target = plan.candidates[index]!;
+    signal?.throwIfAborted(); // Never start a request after cancellation.
+    onAttempt?.(target, index);
+    const record: AttemptRecord = {
+      backend: target.backend,
+      ...(target.model ? { modelId: target.model.id } : {}),
+      tier: target.tier,
+      ok: false,
+    };
+    try {
+      const result = await attemptSearch(query, target, ctx, signal);
+      signal?.throwIfAborted();
+      record.ok = true;
+      attempts.push(record);
+      return { result, target, attempts: attempts.slice(-MAX_ATTEMPT_HISTORY) };
+    } catch (error) {
+      // A cancelled attempt terminates the chain instead of advancing it.
+      signal?.throwIfAborted();
+      record.reason = sanitizeReason(error);
+      attempts.push(record);
     }
   }
-  return { text: await ddgSearch(query, signal), sources: [] };
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function getCurrentProvider(ctx: ExtensionContext) {
-  return ctx.model?.provider;
-}
-function getCurrentModel(ctx: ExtensionContext) {
-  return ctx.model?.id ?? "";
-}
-/** Subscription backends resolve their own auth when called. */
-function canUseNativeSearch(provider: string) {
-  return !!PROVIDERS[provider]?.nativeSearch &&
-    (!!getApiKey(provider) || provider === "claude-bridge" || provider === "openai-codex");
-}
-function getSearchModel(provider: string, ctx: ExtensionContext, config: SearchConfig) {
-  return resolveSearchModel(
-    provider,
-    config.providerOverrides?.[provider]?.model,
-    ctx.model?.provider === provider ? ctx.model.id : undefined,
+  const failures = attempts
+    .filter((attempt) => !attempt.ok)
+    .map((attempt) => `${attempt.backend}${attempt.modelId ? `/${attempt.modelId}` : ""}: ${attempt.reason ?? "failed"}`)
+    .join("; ");
+  throw new Error(
+    failures
+      ? `All search targets failed. ${failures}`
+      : "No search target was available.",
   );
 }
-function getCurrentBaseUrl(ctx: ExtensionContext) {
-  return ctx.model?.baseUrl ?? "";
-}
-function isSearchAvailable(ctx: ExtensionContext, config: SearchConfig) {
-  if (!config.enabled || !config.searchEnabled) return false;
-  const p = getCurrentProvider(ctx);
-  return p ? config.providerOverrides[p]?.searchEnabled !== false : false;
-}
-function isFetchAvailable(ctx: ExtensionContext, config: SearchConfig) {
-  if (!config.enabled || !config.fetchEnabled) return false;
-  const p = getCurrentProvider(ctx);
-  return p ? config.providerOverrides[p]?.fetchEnabled !== false : false;
+
+function degradedNotice(target: SearchTarget, attempts: AttemptRecord[]): string | undefined {
+  const failed = attempts.filter((attempt) => !attempt.ok);
+  if (!failed.length) return undefined;
+  const summary = failed
+    .map((attempt) => `${attempt.backend}${attempt.modelId ? `/${attempt.modelId}` : ""} failed (${attempt.reason ?? "unknown error"})`)
+    .join("; ");
+  return `> Search fallback: ${summary}; used ${describeTarget(target)}.`;
 }
 
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function searchExtension(pi: ExtensionAPI) {
-  let config = loadConfig();
+  let configState: ConfigState = loadSearchConfig();
+  /** Legacy configurations already announced during this session. */
+  const announcedLegacy = new Set<string>();
+
+  function commitConfig(next: SearchConfig) {
+    // An explicit save writes the current shape and repairs any load error.
+    configState = { config: next };
+    saveSearchConfig(next);
+    applyToolsConfig();
+  }
+
+  function announceMigration(ctx: ExtensionContext) {
+    const signature = configState.legacySignature;
+    if (!signature || announcedLegacy.has(signature)) return;
+    announcedLegacy.add(signature);
+    ctx.ui.notify(configState.migrationNotice ?? "Legacy search overrides were ignored.", "warning");
+  }
+
+  function refresh(ctx: ExtensionContext) {
+    configState = loadSearchConfig();
+    announceMigration(ctx);
+    applyToolsConfig();
+    updateStatus(ctx);
+  }
+
+  // ─── web_search ─────────────────────────────────────────────────────────
 
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web. Uses native provider search (including OpenAI ChatGPT subscriptions) or DuckDuckGo fallback. Output limited to 50KB / 2000 lines.",
+      "Search the web. Uses the configured search backend, the active model's backend, ZAI MCP, or DuckDuckGo. Output limited to 50KB / 2000 lines.",
     parameters: Type.Object({ query: Type.String({ description: "Search query" }) }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      if (!isSearchAvailable(ctx, config))
+      if (!configState.config.enabled || !configState.config.searchEnabled) {
         return {
           content: [
             {
@@ -816,49 +831,92 @@ export default function searchExtension(pi: ExtensionAPI) {
           ],
           details: { error: "disabled" },
         };
-      const provider = getCurrentProvider(ctx) ?? "";
-      const model = getSearchModel(provider, ctx, config);
-      const baseUrl = getCurrentBaseUrl(ctx);
-      const hasNative = canUseNativeSearch(provider);
+      }
+      if (searchBlocked(configState)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Web search configuration error: ${configState.error!.message} Use /search to fix it.`,
+            },
+          ],
+          details: { error: "config", query: params.query },
+        };
+      }
+      const plan = planFor(ctx, configState.config);
+      if (plan.error || !plan.candidates.length) {
+        const message = plan.error ?? "No usable search target is configured.";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Web search configuration error: ${message} Use /search to fix it.`,
+            },
+          ],
+          details: { error: "config", query: params.query },
+        };
+      }
       onUpdate?.({
         details: {},
         content: [
           {
             type: "text" as const,
-            text: `Searching${hasNative ? ` (native: ${provider})` : " (DuckDuckGo)"}: "${params.query}"...`,
+            text: `Searching with ${describeTarget(plan.candidates[0]!)}: "${params.query}"...`,
           },
         ],
       });
       try {
-        const { text, sources, apiSources = [], nativeError } = await doSearch(
+        const { result, target, attempts } = await runSearchChain(
           params.query,
-          provider,
-          model,
-          baseUrl,
+          plan,
           ctx,
           signal,
+          (attempt, index) => {
+            onUpdate?.({
+              details: { provider: attempt.backend, tier: attempt.tier },
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Searching with ${describeTarget(attempt)} (attempt ${index + 1}/${plan.candidates.length}): "${params.query}"...`,
+                },
+              ],
+            });
+          },
         );
-        const method = hasNative && !nativeError ? "native" : "ddg";
-        const out = nativeError
-          ? `> Native failed (${nativeError.slice(0, 80)}), used DuckDuckGo.\n\n${text}`
-          : provider === "openai-codex" && method === "native" && !sources.length && !apiSources.length
-            ? `> No structured source metadata was supplied by the provider.\n\n${text}`
-            : text;
+        const notice = degradedNotice(target, attempts);
+        const noMetadata =
+          target.backend === "openai-codex" &&
+          !result.sources.length &&
+          !(result.apiSources?.length ?? 0);
+        const prefix = [notice, noMetadata ? "> No structured source metadata was supplied by the provider." : undefined]
+          .filter(Boolean)
+          .join("\n");
+        const text = prefix ? `${prefix}\n\n${result.text}` : result.text;
         return {
-          content: [{ type: "text" as const, text: formatSearchResult({ text: out, sources, apiSources }) }],
+          content: [
+            {
+              type: "text" as const,
+              text: formatSearchResult({ text, sources: result.sources, apiSources: result.apiSources ?? [] }),
+            },
+          ],
           details: {
             query: params.query,
-            sources,
-            apiSources,
-            provider,
-            method,
-            // Retain the attempted model on fallback, but never label DDG as an LLM.
-            ...(hasNative && model.id ? { searchModel: model.id, searchModelSource: model.source } : {}),
+            sources: result.sources,
+            apiSources: result.apiSources ?? [],
+            provider: target.backend,
+            method: target.backend === "duckduckgo" ? "ddg" : "native",
+            tier: target.tier,
+            // Only the successful LLM target carries a model identity.
+            ...(target.kind === "llm" && target.model
+              ? { searchModel: target.model.id, searchModelSource: target.tier }
+              : {}),
+            ...(attempts.length ? { attempts } : {}),
+            ...(plan.skips.length ? { skips: plan.skips } : {}),
           },
         };
-      } catch (err) {
+      } catch (error) {
         signal?.throwIfAborted();
-        throw err; // Pi marks thrown tool errors as isError.
+        throw error; // Pi marks thrown tool errors as isError.
       }
     },
     renderCall(a, t) {
@@ -885,53 +943,42 @@ export default function searchExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ─── web_fetch ──────────────────────────────────────────────────────────
+
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
     description: "Fetch a web page's text content. Truncated to 50KB / 2000 lines.",
     parameters: Type.Object({ url: Type.String({ description: "URL" }) }),
     async execute(_id, params, signal, onUpdate, ctx) {
-      if (!isFetchAvailable(ctx, config))
+      if (!configState.config.enabled || !configState.config.fetchEnabled) {
         return { content: [{ type: "text" as const, text: "Web fetch disabled." }], details: { error: "disabled" } };
-      const provider = getCurrentProvider(ctx) ?? "";
-      const cap = PROVIDERS[provider];
-      const useNative = !!cap?.nativeFetch && provider === "claude-bridge";
+      }
+      if (fetchBlocked(configState)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Web fetch configuration error: ${configState.error!.message} Use /search to fix it.`,
+            },
+          ],
+          details: { error: "config", url: params.url },
+        };
+      }
       onUpdate?.({
         details: {},
-        content: [
-          {
-            type: "text" as const,
-            text: `Fetching${useNative ? ` (native: ${provider})` : ""} ${params.url}...`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Fetching ${params.url}...` }],
       });
       try {
-        let text: string;
-        let nativeError: string | undefined;
-        if (useNative) {
-          try {
-            text = await claudeBridgeFetch(params.url, signal);
-          } catch (err: any) {
-            nativeError = err.message;
-            text = await httpFetch(params.url, signal);
-          }
-        } else {
-          text = await httpFetch(params.url, signal);
-        }
-        const out = nativeError
-          ? `> Native failed (${nativeError.slice(0, 80)}), used local fetch.\n\n${text}`
-          : text;
-        return {
-          content: [{ type: "text" as const, text: out }],
-          details: {
-            url: params.url,
-            provider,
-            method: useNative && !nativeError ? "native" : "local",
-          },
-        };
-      } catch (err) {
+        const text = await httpFetch(params.url, signal);
         signal?.throwIfAborted();
-        throw err;
+        return {
+          content: [{ type: "text" as const, text }],
+          details: { url: params.url, method: "local" },
+        };
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
       }
     },
     renderCall(a, t) {
@@ -975,20 +1022,14 @@ export default function searchExtension(pi: ExtensionAPI) {
         return;
       }
       if (sub === "on") {
-        config.enabled = true;
-        config.searchEnabled = true;
-        config.fetchEnabled = true;
-        saveConfig(config);
-        pi.setActiveTools([...pi.getActiveTools(), "web_search", "web_fetch"]);
+        commitConfig({ ...configState.config, enabled: true, searchEnabled: true, fetchEnabled: true });
+        updateStatus(ctx);
         ctx.ui.notify("Search enabled", "info");
         return;
       }
       if (sub === "off") {
-        config.enabled = false;
-        saveConfig(config);
-        pi.setActiveTools(
-          pi.getActiveTools().filter((t) => t !== "web_search" && t !== "web_fetch"),
-        );
+        commitConfig({ ...configState.config, enabled: false });
+        updateStatus(ctx);
         ctx.ui.notify("Search disabled", "info");
         return;
       }
@@ -996,211 +1037,317 @@ export default function searchExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ─── Settings: only configured providers ────────────────────────────────
+  // ─── Settings ───────────────────────────────────────────────────────────
+
+  function selectTheme(theme: any) {
+    return {
+      selectedPrefix: (text: string) => theme.fg("accent", text),
+      selectedText: (text: string) => theme.fg("accent", text),
+      description: (text: string) => theme.fg("muted", text),
+      scrollInfo: (text: string) => theme.fg("dim", text),
+      noMatch: (text: string) => theme.fg("warning", text),
+    };
+  }
 
   async function showSearchSettings(ctx: ExtensionContext) {
     await ctx.ui.custom((tui, theme, _kb, done) => {
-      const items: SettingItem[] = [
-        {
-          id: "enabled",
-          label: "Search Extension",
-          currentValue: config.enabled ? "enabled" : "disabled",
-          values: ["enabled", "disabled"],
-        },
-        {
-          id: "search",
-          label: "Web Search",
-          currentValue: config.searchEnabled ? "enabled" : "disabled",
-          values: ["enabled", "disabled"],
-        },
-        {
-          id: "fetch",
-          label: "Web Fetch",
-          currentValue: config.fetchEnabled ? "enabled" : "disabled",
-          values: ["enabled", "disabled"],
-        },
-      ];
+      const themeKit = selectTheme(theme);
 
-      const currentProvider = getCurrentProvider(ctx);
-      for (const pid of Object.keys(PROVIDERS).sort()) {
-        if (!hasCredentials(pid, ctx) && pid !== currentProvider) continue;
-        const cap = PROVIDERS[pid]!;
-        const override = config.providerOverrides[pid];
-        const native = cap.nativeSearch ? " [native]" : "";
-        const current = pid === currentProvider ? " ← current" : "";
-        items.push({
-          id: `provider:${pid}:search`,
-          label: `${cap.name}${native}${current} - Search`,
-          currentValue: override?.searchEnabled === false ? "disabled" : "enabled",
-          values: ["enabled", "disabled"],
-        });
-      }
+      const submenu = (heading: string, list: SelectList, hint: string) => {
+        const container = new Container();
+        container.addChild(new Text(theme.fg("accent", theme.bold(heading))));
+        container.addChild(new Text(theme.fg("dim", hint)));
+        container.addChild(new Text(""));
+        container.addChild(list);
+        container.addChild(new Text(theme.fg("dim", "↑↓ select • enter confirm • esc back")));
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            list.handleInput(data);
+            tui.requestRender();
+          },
+        };
+      };
+
+      const backendSubmenu = (currentValue: string, close: (value?: string) => void) => {
+        const items: SelectItem[] = [
+          {
+            value: AUTOMATIC,
+            label: "Automatic",
+            description: "Start with the active conversation model, then fall back.",
+          },
+          ...SEARCH_BACKEND_IDS.map((id) => ({
+            value: id,
+            label: SEARCH_BACKENDS[id].name,
+            description: `${SEARCH_BACKENDS[id].kind === "llm" ? "LLM search (requires a registered model)" : "Non-LLM search"} | credentials: ${readinessLabel(overviewReadiness(id, ctx))}`,
+          })),
+        ];
+        const list = new SelectList(items, Math.min(items.length, MAX_VISIBLE_ITEMS), themeKit);
+        list.setSelectedIndex(Math.max(0, items.findIndex((item) => item.value === currentValue)));
+        list.onSelect = (item) => close(item.value);
+        list.onCancel = () => close();
+        return submenu("Search Backend", list, "Only implemented search backends are listed");
+      };
+
+      const modelSubmenu = (backend: SearchBackendId, currentValue: string, close: (value?: string) => void) => {
+        const models = registeredModels(backend, ctx);
+        const items: SelectItem[] = [
+          {
+            value: AUTOMATIC,
+            label: "Not set",
+            description: "Skip the pinned tier and continue with the fallback chain.",
+          },
+          ...models.map((model) => ({
+            value: model.id,
+            label: model.name ? `${model.name} (${model.id})` : model.id,
+            description: "Pi-registered model for this backend",
+          })),
+        ];
+        const list = new SelectList(items, Math.min(items.length, MAX_VISIBLE_ITEMS), themeKit);
+        list.setSelectedIndex(Math.max(0, items.findIndex((item) => item.value === currentValue)));
+        list.onSelect = (item) => close(item.value);
+        list.onCancel = () => close();
+        return submenu(
+          `${backendName(backend)} Search Model`,
+          list,
+          models.length
+            ? "Only Pi-registered models for this backend are listed"
+            : "No models are registered for this backend in Pi",
+        );
+      };
+
+      const buildItems = (): SettingItem[] => {
+        const config = configState.config;
+        const items: SettingItem[] = [
+          {
+            id: "enabled",
+            label: "Search Extension",
+            currentValue: config.enabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "search",
+            label: "Web Search",
+            currentValue: config.searchEnabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "fetch",
+            label: "Web Fetch",
+            currentValue: config.fetchEnabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "target",
+            label: "Search Backend",
+            description: "Global search target; automatic starts with the active conversation model.",
+            currentValue: config.searchProvider ?? AUTOMATIC,
+            submenu: (current, close) => backendSubmenu(current, close),
+          },
+        ];
+        if (config.searchProvider && isLlmBackend(config.searchProvider)) {
+          items.push({
+            id: "model",
+            label: "Search Model",
+            description: "Pi-registered models only; leaving this unset skips the pinned tier.",
+            currentValue: config.searchModel ?? AUTOMATIC,
+            submenu: (current, close) => modelSubmenu(config.searchProvider!, current, close),
+          });
+        }
+        return items;
+      };
+
+      const onChange = (id: string, value: string) => {
+        const next: SearchConfig = { ...configState.config };
+        if (id === "enabled") next.enabled = value === "enabled";
+        else if (id === "search") next.searchEnabled = value === "enabled";
+        else if (id === "fetch") next.fetchEnabled = value === "enabled";
+        else if (id === "target") {
+          next.searchProvider = value === AUTOMATIC ? undefined : (value as SearchBackendId);
+          if (!next.searchProvider || !isLlmBackend(next.searchProvider)) {
+            next.searchModel = undefined; // Non-LLM backends take no model.
+          } else if (
+            next.searchModel &&
+            !registeredModels(next.searchProvider, ctx).some((model) => model.id === next.searchModel)
+          ) {
+            next.searchModel = undefined; // Stale selection cleared on backend change.
+          }
+        } else if (id === "model") {
+          next.searchModel = value === AUTOMATIC ? undefined : value;
+        }
+        commitConfig(next);
+        updateStatus(ctx);
+        list = createList();
+        list.selectItem(id);
+        tui.requestRender();
+      };
+
+      const createList = () =>
+        new SettingsList(buildItems(), MAX_VISIBLE_ITEMS, getSettingsListTheme(), onChange, () => done(undefined));
+
+      let list = createList();
+      const host = {
+        render: (width: number) => list.render(width),
+        invalidate: () => list.invalidate(),
+        handleInput: (data: string) => {
+          list.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
 
       const container = new Container();
       container.addChild(new Text(theme.fg("accent", theme.bold("Search Settings"))));
-      container.addChild(
-        new Text(
-          theme.fg(
-            "dim",
-            "Showing configured providers only • /search providers for all",
-          ),
-        ),
-      );
+      container.addChild(new Text(theme.fg("dim", "Global search target • /search providers for backend details")));
+      if (configState.error) {
+        container.addChild(new Text(theme.fg("error", `Configuration error: ${configState.error.message}`)));
+      }
       container.addChild(new Text(""));
-
-      const settingsList = new SettingsList(
-        items,
-        Math.min(items.length + 2, 20),
-        getSettingsListTheme(),
-        (id, val) => {
-          if (id === "enabled") config.enabled = val === "enabled";
-          else if (id === "search") config.searchEnabled = val === "enabled";
-          else if (id === "fetch") config.fetchEnabled = val === "enabled";
-          else if (id.startsWith("provider:")) {
-            const pid = id.split(":")[1]!;
-            if (!config.providerOverrides[pid]) config.providerOverrides[pid] = {};
-            config.providerOverrides[pid]!.searchEnabled = val === "enabled";
-          }
-          saveConfig(config);
-          applyToolsConfig(ctx);
-        },
-        () => done(undefined),
-      );
-      container.addChild(settingsList);
-      container.addChild(
-        new Text(theme.fg("dim", "↑↓ navigate • tab toggle • esc close")),
-      );
+      container.addChild(host);
+      container.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter/space change • esc close")));
       return {
-        render(w: number) {
-          return container.render(w);
+        render(width: number) {
+          return container.render(width);
         },
         invalidate() {
           container.invalidate();
         },
-        handleInput(d: string) {
-          settingsList.handleInput(d);
-          tui.requestRender();
+        handleInput(data: string) {
+          host.handleInput(data);
         },
       };
     });
   }
 
-  // ─── All providers view ─────────────────────────────────────────────────
+  // ─── Implemented backends view ──────────────────────────────────────────
 
   async function showProviders(ctx: ExtensionContext) {
-    const currentProvider = getCurrentProvider(ctx);
-    const items: SelectItem[] = Object.entries(PROVIDERS)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([id, cap]) => ({
+    const configured = configState.config.searchProvider;
+    const items: SelectItem[] = SEARCH_BACKEND_IDS.map((id) => {
+      const backend = SEARCH_BACKENDS[id];
+      const models = backend.kind === "llm" ? registeredModels(id, ctx) : [];
+      const kind =
+        backend.kind === "llm"
+          ? `LLM search • ${models.length} registered model${models.length === 1 ? "" : "s"}`
+          : "non-LLM search";
+      return {
         value: id,
-        label: `${cap.name}${id === currentProvider ? " ← current" : ""}${hasCredentials(id, ctx) ? " ✓" : ""}`,
-        description: `search: ${cap.nativeSearch ? `native (${id === "zai" ? "MCP" : `model: ${describeSearchModel(getSearchModel(id, ctx, config))}`})` : "duckduckgo"} | auth: ${hasCredentials(id, ctx) ? "yes" : "no"}`,
-      }));
+        label: `${backend.name}${configured === id ? " ← configured" : ""}`,
+        description: `${kind} | credentials: ${readinessLabel(overviewReadiness(id, ctx))}`,
+      };
+    });
 
     await ctx.ui.custom((tui, theme, _kb, done) => {
       const container = new Container();
-      container.addChild(new Text(theme.fg("accent", theme.bold("All Providers"))));
-      container.addChild(new Text(theme.fg("dim", "✓ = has credentials (API key or subscription)")));
+      container.addChild(new Text(theme.fg("accent", theme.bold("Implemented Search Backends"))));
+      container.addChild(new Text(theme.fg("dim", "Only these backends are selectable; provider-specific toggles were removed.")));
       container.addChild(new Text(""));
-      const sl = new SelectList(items, Math.min(items.length, 15), {
-        selectedPrefix: (t) => theme.fg("accent", t),
-        selectedText: (t) => theme.fg("accent", t),
-        description: (t) => theme.fg("muted", t),
-        scrollInfo: (t) => theme.fg("dim", t),
-        noMatch: (t) => theme.fg("warning", t),
-      });
-      sl.onSelect = () => {};
-      sl.onCancel = () => done(undefined);
-      container.addChild(sl);
+      const list = new SelectList(items, MAX_VISIBLE_ITEMS, selectTheme(theme));
+      list.onSelect = () => {};
+      list.onCancel = () => done(undefined);
+      container.addChild(list);
       container.addChild(new Text(theme.fg("dim", "esc close")));
       return {
-        render(w: number) {
-          return container.render(w);
+        render(width: number) {
+          return container.render(width);
         },
         invalidate() {
           container.invalidate();
         },
-        handleInput(d: string) {
-          sl.handleInput(d);
+        handleInput(data: string) {
+          list.handleInput(data);
           tui.requestRender();
         },
       };
     });
   }
 
+  // ─── Config display ─────────────────────────────────────────────────────
+
   function showConfig(ctx: ExtensionContext) {
-    const provider = getCurrentProvider(ctx);
-    const model = getCurrentModel(ctx);
-    const baseUrl = getCurrentBaseUrl(ctx);
-    const cap = provider ? PROVIDERS[provider] : undefined;
-    const native = canUseNativeSearch(provider ?? "");
-    ctx.ui.notify(
-      [
-        `Extension: ${config.enabled ? "enabled" : "disabled"}`,
-        `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"}`,
-        ``,
-        `Provider: ${cap?.name ?? provider ?? "?"} ${hasCredentials(provider ?? "", ctx) ? "✓" : "✗"}`,
-        `Session model: ${model || "?"}`,
-        `Search backend: ${native ? provider === "zai" ? "ZAI MCP" : "native LLM" : "DuckDuckGo"}`,
-        `Search model: ${native ? describeSearchModel(getSearchModel(provider ?? "", ctx, config)) : "not applicable (DuckDuckGo)"}`,
-        `Session base URL: ${baseUrl || "?"}`,
-        `Native: ${native ? "yes" : "no"} | Fallback: DuckDuckGo`,
-      ].join("\n"),
-      "info",
+    const config = configState.config;
+    const sessionProvider = ctx.model?.provider ?? "?";
+    const sessionModel = ctx.model?.id ?? "?";
+    const lines = [
+      `Extension: ${config.enabled ? "enabled" : "disabled"}`,
+      `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"}`,
+    ];
+    if (configState.error) {
+      lines.push(`Configuration error (${configState.error.scope}): ${configState.error.message}`);
+    }
+    lines.push("");
+    lines.push(`Session model: ${sessionModel} (${sessionProvider})`);
+    lines.push(
+      `Session search support: ${isLlmBackend(sessionProvider) ? "yes" : "no implemented search backend"}`,
     );
+    lines.push(`Configured backend: ${config.searchProvider ?? "automatic"}`);
+    lines.push(
+      `Configured model: ${config.searchModel ?? "not set (pinned LLM tier skipped)"}`,
+    );
+    lines.push("");
+    if (searchBlocked(configState)) {
+      lines.push("Planned search target: unavailable until the configuration error is fixed");
+    } else {
+      const plan = planFor(ctx, config);
+      if (plan.error) {
+        lines.push(`Planned search target: unavailable (${plan.error})`);
+      } else if (!plan.candidates.length) {
+        lines.push("Planned search target: none");
+      } else {
+        lines.push(`Planned search target: ${describeTarget(plan.candidates[0]!)}`);
+        lines.push(`Fallback chain: ${plan.candidates.map(describeTarget).join(" → ")}`);
+        if (plan.skips.length) {
+          lines.push(
+            `Skipped: ${plan.skips
+              .map((skip) => `${skip.backend}${skip.modelId ? `/${skip.modelId}` : ""} (${skip.reason})`)
+              .join("; ")}`,
+          );
+        }
+      }
+    }
+    lines.push("");
+    lines.push("Fetch: direct HTTP (no search credentials or backend routing)");
+    ctx.ui.notify(lines.join("\n"), "info");
   }
 
-  // ─── Apply ──────────────────────────────────────────────────────────────
+  // ─── Tool activation and status ─────────────────────────────────────────
 
-  function applyToolsConfig(ctx: ExtensionContext) {
-    const a = pi
+  function applyToolsConfig() {
+    const active = pi
       .getActiveTools()
-      .filter((t) => t !== "web_search" && t !== "web_fetch");
-    if (config.enabled && isSearchAvailable(ctx, config)) a.push("web_search");
-    if (config.enabled && isFetchAvailable(ctx, config)) a.push("web_fetch");
-    pi.setActiveTools(a);
+      .filter((tool) => tool !== "web_search" && tool !== "web_fetch");
+    // Only global switches govern availability, never the conversation provider.
+    if (configState.config.enabled && configState.config.searchEnabled) active.push("web_search");
+    if (configState.config.enabled && configState.config.fetchEnabled) active.push("web_fetch");
+    pi.setActiveTools(active);
   }
 
   function updateStatus(ctx: ExtensionContext) {
-    if (!config.enabled) {
+    if (!configState.config.enabled) {
       ctx.ui.setStatus("search", undefined);
       return;
     }
-    const p = getCurrentProvider(ctx);
-    const model = getSearchModel(p ?? "", ctx, config);
-    const cap = p ? PROVIDERS[p] : undefined;
-    const m =
-      canUseNativeSearch(p ?? "")
-        ? `native:${p === "zai" ? "mcp" : describeSearchModel(model)}`
-        : "ddg";
-    const fetchBackend =
-      cap?.nativeFetch && hasCredentials(p ?? "", ctx) && p === "claude-bridge"
-        ? "fetch:cc-sdk"
-        : "fetch";
     const parts: string[] = [];
-    if (config.searchEnabled) parts.push(`search:${m}`);
-    if (config.fetchEnabled) parts.push(fetchBackend);
+    if (configState.config.searchEnabled) {
+      let label = "config-error";
+      if (!searchBlocked(configState)) {
+        const plan = planFor(ctx, configState.config);
+        label = plan.error
+          ? "config-error"
+          : plan.candidates.length
+            ? describeTarget(plan.candidates[0]!)
+            : "none";
+      }
+      parts.push(`search:${label}`);
+    }
+    if (configState.config.fetchEnabled) parts.push("fetch:http");
     ctx.ui.setStatus(
       "search",
-      parts.length
-        ? ctx.ui.theme.fg("accent", `search[${parts.join(",")}]`)
-        : undefined,
+      parts.length ? ctx.ui.theme.fg("accent", `search[${parts.join(",")}]`) : undefined,
     );
   }
 
-  pi.on("session_start", async (_, ctx) => {
-    config = loadConfig();
-    applyToolsConfig(ctx);
-    updateStatus(ctx);
-  });
-  pi.on("model_select", async (_, ctx) => {
-    config = loadConfig();
-    applyToolsConfig(ctx);
-    updateStatus(ctx);
-  });
-  pi.on("session_tree", async (_, ctx) => {
-    config = loadConfig();
-    applyToolsConfig(ctx);
-    updateStatus(ctx);
-  });
+  pi.on("session_start", async (_, ctx) => refresh(ctx));
+  pi.on("model_select", async (_, ctx) => refresh(ctx));
+  pi.on("session_tree", async (_, ctx) => refresh(ctx));
 }

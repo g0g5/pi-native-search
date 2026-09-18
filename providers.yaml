@@ -1,130 +1,59 @@
-# Provider capabilities registry
-# Each entry lists which native tools the provider supports.
-# When a provider has native support, the extension delegates to it.
-# When not, the extension uses a generic HTTP-based implementation.
+# Search backends implemented by this extension (documentation only).
+#
+# The runtime source of truth is SEARCH_BACKENDS in
+# extensions/search-providers.ts. This file is not read at runtime; it exists so
+# the backend set, capability kind, and authentication mode are documented next
+# to the fork notes. tests/providers-doc.test.ts compares this file with the
+# runtime registry, so keep them in sync.
+#
+# kind: llm      -> invokes a provider LLM and requires a registered model when
+#                   pinned as the global target.
+# kind: non-llm  -> invokes no LLM and never requires a model.
+#
+# auth: api-key           -> environment variable or Pi auth.json api_key entry
+#       pi-oauth          -> Pi's OAuth credentials for a registered model
+#       cli-subscription  -> the `claude` CLI's own subscription login
+#       none              -> no credentials
+#
+# Providers without an implemented search adapter (DeepSeek, OpenRouter, Mistral,
+# Groq, and so on) are intentionally absent: they remain valid conversation
+# providers but are not selectable search backends.
 
-providers:
-  # --- Providers with native web search ---
+backends:
   google:
-    name: "Google Gemini"
-    native_search: true
-    native_fetch: false
-    # Uses google_search grounding tool via Gemini API
-    search_type: "google_search_grounding"
-
+    name: Google Gemini
+    kind: llm
+    auth: api-key
+    env_key: GEMINI_API_KEY
   openai:
-    name: "OpenAI"
-    native_search: true
-    native_fetch: false
-    # Uses web_search tool via OpenAI Responses API
-    search_type: "openai_web_search"
-
+    name: OpenAI
+    kind: llm
+    auth: api-key
+    env_key: OPENAI_API_KEY
   openai-codex:
-    name: "OpenAI ChatGPT (subscription)"
-    native_search: true
-    native_fetch: false
-    # Pi's existing ChatGPT OAuth login; separate from OPENAI_API_KEY.
-    search_type: "codex_responses_web_search"
-
-  openrouter:
-    name: "OpenRouter"
-    native_search: true
-    native_fetch: false
-    # Can route to perplexity/sonar models
-    search_type: "openrouter_sonar"
-
-  perplexity:
-    name: "Perplexity"
-    native_search: true
-    native_fetch: true
-    # Sonar API - all responses are web-grounded
-    search_type: "perplexity_sonar"
-
+    name: OpenAI ChatGPT (subscription)
+    kind: llm
+    auth: pi-oauth
   xai:
-    name: "xAI (Grok)"
-    native_search: true
-    native_fetch: false
-    # Grok has built-in web search
-    search_type: "xai_search"
-
-  zai:
-    name: "ZAI"
-    native_search: true
-    native_fetch: true
-    search_type: "zai_search"
-
-  # --- Providers that need HTTP-based fallback ---
+    name: xAI (Grok)
+    kind: llm
+    auth: api-key
+    env_key: XAI_API_KEY
   anthropic:
-    name: "Anthropic"
-    native_search: false
-    native_fetch: false
-
-  deepseek:
-    name: "DeepSeek"
-    native_search: false
-    native_fetch: false
-
-  mistral:
-    name: "Mistral"
-    native_search: false
-    native_fetch: false
-
-  groq:
-    name: "Groq"
-    native_search: false
-    native_fetch: false
-
-  cerebras:
-    name: "Cerebras"
-    native_search: false
-    native_fetch: false
-
-  huggingface:
-    name: "Hugging Face"
-    native_search: false
-    native_fetch: false
-
-  fireworks:
-    name: "Fireworks"
-    native_search: false
-    native_fetch: false
-
-  cloudflare:
-    name: "Cloudflare"
-    native_search: false
-    native_fetch: false
-
-  amazon-bedrock:
-    name: "Amazon Bedrock"
-    native_search: false
-    native_fetch: false
-
-  azure-openai:
-    name: "Azure OpenAI"
-    native_search: false
-    native_fetch: false
-
-  kimi:
-    name: "Kimi"
-    native_search: false
-    native_fetch: false
-
-  minimax:
-    name: "MiniMax"
-    native_search: false
-    native_fetch: false
-
-  github-copilot:
-    name: "GitHub Copilot"
-    native_search: false
-    native_fetch: false
-
-  vercel:
-    name: "Vercel AI Gateway"
-    native_search: false
-    native_fetch: false
-
-  opencode:
-    name: "OpenCode"
-    native_search: false
-    native_fetch: false
+    name: Anthropic
+    kind: llm
+    auth: api-key
+    env_key: ANTHROPIC_API_KEY
+  claude-bridge:
+    name: Claude Code (subscription)
+    kind: llm
+    auth: cli-subscription
+  zai:
+    name: ZAI Web Search MCP (GLM)
+    kind: non-llm
+    auth: api-key
+    env_key: ZAI_API_KEY
+  duckduckgo:
+    name: DuckDuckGo
+    kind: non-llm
+    auth: none

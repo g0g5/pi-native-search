@@ -95,7 +95,7 @@ test("Anthropic tool error falls back without leaking partial text/sources or af
   assert.equal(calls, 2);
   assert.equal(result.details.method, "ddg");
   assert.deepEqual(result.details.sources, []);
-  assert.match(result.content[0].text, /Native failed \(Anthropic web search tool failed/);
+  assert.match(result.content[0].text, /Search fallback: anthropic\/model failed \(Anthropic web search tool failed/);
   assert.match(result.content[0].text, /Fallback/);
   assert.doesNotMatch(result.content[0].text, /Partial answer|docs.example/);
   const next = await search.execute("next", { query: "q2" }, undefined, undefined, ctx);
@@ -136,7 +136,7 @@ test("Codex registered tool propagates structured SSE sources without real OAuth
   const token = `header.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fake-account" } })).toString("base64url")}.signature`;
   const result = await tool().execute("id", { query: "q" }, undefined, undefined, {
     model: { provider: "openai-codex", id: "model" },
-    modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token }) },
+    modelRegistry: { hasConfiguredAuth: () => true, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token }) },
   });
   assert.equal(result.details.method, "native");
   assert.deepEqual(result.details.sources, [source]);

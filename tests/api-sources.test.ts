@@ -109,7 +109,7 @@ for (const scenario of ["api", "mixed", "missing", "failed"] as const) {
     const search = tool();
     const result = await search.execute("id", { query: "weather" }, undefined, undefined, {
       model: { provider: "openai-codex", id: "model" },
-      modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token }) },
+      modelRegistry: { hasConfiguredAuth: () => true, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: token }) },
     });
     const hasApi = scenario === "api" || scenario === "mixed";
     assert.deepEqual(result.details.apiSources, hasApi ? [api] : []);
