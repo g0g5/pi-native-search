@@ -20,14 +20,17 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { chatgptSearch } from "./chatgpt-search.ts";
+import { formatSearchResult, parseAnthropicSearch, parseGoogleSearch, parseResponsesSearch, type SearchResult } from "./search-result.ts";
+import { resolveSearchModel, describeSearchModel, type SearchModelSelection } from "./search-model.ts";
 import {
   getAgentDir,
   truncateHead,
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
-} from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+} from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   Container,
   type SettingItem,
@@ -35,8 +38,8 @@ import {
   Text,
   type SelectItem,
   SelectList,
-} from "@mariozechner/pi-tui";
-import { getSettingsListTheme } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-tui";
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 
 interface SearchConfig {
   enabled: boolean;
@@ -44,7 +47,7 @@ interface SearchConfig {
   fetchEnabled: boolean;
   providerOverrides: Record<
     string,
-    { searchEnabled?: boolean; fetchEnabled?: boolean }
+    { searchEnabled?: boolean; fetchEnabled?: boolean; model?: string }
   >;
 }
 
@@ -74,6 +77,12 @@ const PROVIDERS: Record<
     nativeSearch: true,
     nativeFetch: false,
     envKey: "OPENAI_API_KEY",
+  },
+  "openai-codex": {
+    name: "OpenAI ChatGPT (subscription)",
+    nativeSearch: true,
+    nativeFetch: false,
+    envKey: "", // OAuth is resolved/refreshed by Pi, not OPENAI_API_KEY.
   },
   xai: {
     name: "xAI (Grok)",
@@ -229,7 +238,13 @@ function getApiKey(provider: string): string | undefined {
 }
 
 /** Check if a provider has credentials configured */
-function hasCredentials(provider: string): boolean {
+function hasCredentials(provider: string, ctx: ExtensionContext): boolean {
+  if (provider === "openai-codex") {
+    const model = ctx.model?.provider === provider
+      ? ctx.model
+      : ctx.modelRegistry.getAll().find((m) => m.provider === provider);
+    return !!model && ctx.modelRegistry.hasConfiguredAuth(model);
+  }
   // claude-bridge uses the `claude` CLI's own subscription auth — assume it's
   // available if the user has selected this provider in pi.
   if (provider === "claude-bridge") return true;
@@ -372,7 +387,7 @@ async function anthropicSearch(
   apiKey: string,
   baseUrl: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<SearchResult> {
   const url = baseUrl
     ? `${baseUrl.replace(/\/+$/, "")}/v1/messages`
     : "https://api.anthropic.com/v1/messages";
@@ -395,33 +410,7 @@ async function anthropicSearch(
     throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
 
-  const parts: string[] = [];
-  const sources: { title: string; url: string }[] = [];
-
-  for (const block of data.content || []) {
-    if (block.type === "text") {
-      parts.push(block.text);
-    } else if (block.type === "web_search_tool_result") {
-      for (const result of block.content || []) {
-        if (result.type === "web_search_result") {
-          sources.push({ title: result.title || "", url: result.url || "" });
-        }
-      }
-    } else if (block.type === "text" && block.citations) {
-      for (const cit of block.citations || []) {
-        if (cit.type === "web_search_result_location") {
-          sources.push({ title: cit.title || "", url: cit.url || "" });
-        }
-      }
-    }
-  }
-
-  if (sources.length) {
-    parts.push("\n## Sources:");
-    for (const s of sources.slice(0, 8)) parts.push(`- [${s.title}](${s.url})`);
-  }
-
-  return parts.join("\n") || "No results found.";
+  return parseAnthropicSearch(data);
 }
 
 // ─── Other Native Search ─────────────────────────────────────────────────────
@@ -431,7 +420,7 @@ async function googleSearch(
   model: string,
   apiKey: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<SearchResult> {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
@@ -447,15 +436,7 @@ async function googleSearch(
   if (!res.ok)
     throw new Error(`Google ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
-  const parts: string[] = [];
-  const c = data.candidates?.[0];
-  if (c?.content?.parts?.[0]?.text) parts.push(c.content.parts[0].text);
-  if (c?.groundingMetadata?.groundingChunks) {
-    parts.push("\n## Sources:");
-    for (const ch of c.groundingMetadata.groundingChunks.slice(0, 8))
-      if (ch.web) parts.push(`- [${ch.web.title}](${ch.web.uri})`);
-  }
-  return parts.join("\n") || "No results found.";
+  return parseGoogleSearch(data);
 }
 
 async function openaiSearch(
@@ -463,7 +444,7 @@ async function openaiSearch(
   model: string,
   apiKey: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<SearchResult> {
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     signal,
@@ -471,27 +452,14 @@ async function openaiSearch(
     body: JSON.stringify({
       model,
       tools: [{ type: "web_search" }],
+      include: ["web_search_call.action.sources"],
       input: query,
     }),
   });
   if (!res.ok)
     throw new Error(`OpenAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
-  const parts: string[] = [];
-  for (const item of data.output || []) {
-    if (item.type === "message" && item.content?.[0]?.text) {
-      parts.push(item.content[0].text);
-      const urls =
-        item.content[0].annotations
-          ?.filter((a: any) => a.type === "url_citation")
-          .map((a: any) => `- [${a.title}](${a.url})`) || [];
-      if (urls.length) {
-        parts.push("\n## Sources:");
-        parts.push(...urls.slice(0, 8));
-      }
-    }
-  }
-  return parts.join("\n") || "No results found.";
+  return parseResponsesSearch(data.output, { searchSources: true });
 }
 
 async function xaiSearch(
@@ -499,7 +467,7 @@ async function xaiSearch(
   model: string,
   apiKey: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<SearchResult> {
   const res = await fetch("https://api.x.ai/v1/responses", {
     method: "POST",
     signal,
@@ -513,15 +481,7 @@ async function xaiSearch(
   if (!res.ok)
     throw new Error(`xAI ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
-  const parts: string[] = [];
-  for (const item of data.output || [])
-    if (item.type === "message" && item.content?.[0]?.text)
-      parts.push(item.content[0].text);
-  if (data.citations?.length) {
-    parts.push("\n## Sources:");
-    for (const c of data.citations.slice(0, 8)) parts.push(`- ${c}`);
-  }
-  return parts.join("\n") || "No results found.";
+  return parseResponsesSearch(data.output, { citations: data.citations, numericTitles: true });
 }
 
 // ─── Claude Code (via claude-agent-sdk) ─────────────────────────────────────
@@ -576,6 +536,7 @@ async function loadClaudeAgentSdk(): Promise<any> {
 async function claudeBridgeSearch(
   query: string,
   signal?: AbortSignal,
+  model?: string,
 ): Promise<string> {
   const sdk = await loadClaudeAgentSdk();
   const sdkQuery = sdk.query({
@@ -588,6 +549,7 @@ async function claudeBridgeSearch(
       cwd: process.cwd(),
       permissionMode: "bypassPermissions",
       allowedTools: ["WebSearch"],
+      ...(model ? { model } : {}),
       systemPrompt: { type: "preset", preset: "claude_code" },
       settingSources: [],
     },
@@ -759,38 +721,43 @@ async function httpFetch(url: string, signal?: AbortSignal): Promise<string> {
 async function doSearch(
   query: string,
   provider: string,
-  model: string,
+  selection: SearchModelSelection,
   baseUrl: string,
+  ctx: ExtensionContext,
   signal?: AbortSignal,
-): Promise<{ text: string; nativeError?: string }> {
+): Promise<SearchResult & { nativeError?: string }> {
+  signal?.throwIfAborted();
+  const model = selection.id ?? "";
   const apiKey = getApiKey(provider);
-  const cap = PROVIDERS[provider];
-  // claude-bridge uses the `claude` CLI's own subscription auth, so it doesn't
-  // need an api_key in pi's auth.json.
-  const hasAuth = !!apiKey || provider === "claude-bridge";
-  if (cap?.nativeSearch && hasAuth) {
+  if (canUseNativeSearch(provider)) {
     try {
       switch (provider) {
         case "zai":
-          return { text: await zaiSearch(query, apiKey!, signal) };
+          return { text: await zaiSearch(query, apiKey!, signal), sources: [] };
         case "google":
-          return { text: await googleSearch(query, model, apiKey!, signal) };
+          return await googleSearch(query, model, apiKey!, signal);
         case "openai":
-          return { text: await openaiSearch(query, model, apiKey!, signal) };
+          return await openaiSearch(query, model, apiKey!, signal);
+        case "openai-codex": {
+          const searchModel = selection.source === "configured"
+            ? ctx.modelRegistry.find(provider, model)
+            : ctx.model;
+          if (!searchModel) throw new Error(`Search model not registered: ${provider}/${model}`);
+          return await chatgptSearch(query, ctx, signal, undefined, searchModel);
+        }
         case "xai":
-          return { text: await xaiSearch(query, model, apiKey!, signal) };
+          return await xaiSearch(query, model, apiKey!, signal);
         case "anthropic":
-          return {
-            text: await anthropicSearch(query, model, apiKey!, baseUrl, signal),
-          };
+          return await anthropicSearch(query, model, apiKey!, baseUrl, signal);
         case "claude-bridge":
-          return { text: await claudeBridgeSearch(query, signal) };
+          return { text: await claudeBridgeSearch(query, signal, selection.id), sources: [] };
       }
     } catch (err: any) {
-      return { text: await ddgSearch(query, signal), nativeError: err.message };
+      signal?.throwIfAborted(); // Cancellation must not start a fallback request.
+      return { text: await ddgSearch(query, signal), sources: [], nativeError: err.message };
     }
   }
-  return { text: await ddgSearch(query, signal) };
+  return { text: await ddgSearch(query, signal), sources: [] };
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -800,6 +767,18 @@ function getCurrentProvider(ctx: ExtensionContext) {
 }
 function getCurrentModel(ctx: ExtensionContext) {
   return ctx.model?.id ?? "";
+}
+/** Subscription backends resolve their own auth when called. */
+function canUseNativeSearch(provider: string) {
+  return !!PROVIDERS[provider]?.nativeSearch &&
+    (!!getApiKey(provider) || provider === "claude-bridge" || provider === "openai-codex");
+}
+function getSearchModel(provider: string, ctx: ExtensionContext, config: SearchConfig) {
+  return resolveSearchModel(
+    provider,
+    config.providerOverrides?.[provider]?.model,
+    ctx.model?.provider === provider ? ctx.model.id : undefined,
+  );
 }
 function getCurrentBaseUrl(ctx: ExtensionContext) {
   return ctx.model?.baseUrl ?? "";
@@ -824,7 +803,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Search the web. Uses native provider search (ZAI MCP, Anthropic, Google, OpenAI, xAI) or DuckDuckGo fallback.",
+      "Search the web. Uses native provider search (including OpenAI ChatGPT subscriptions) or DuckDuckGo fallback. Output limited to 50KB / 2000 lines.",
     parameters: Type.Object({ query: Type.String({ description: "Search query" }) }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!isSearchAvailable(ctx, config))
@@ -838,13 +817,11 @@ export default function searchExtension(pi: ExtensionAPI) {
           details: { error: "disabled" },
         };
       const provider = getCurrentProvider(ctx) ?? "";
-      const model = getCurrentModel(ctx);
+      const model = getSearchModel(provider, ctx, config);
       const baseUrl = getCurrentBaseUrl(ctx);
-      const cap = PROVIDERS[provider];
-      const hasNative =
-        !!cap?.nativeSearch &&
-        (!!getApiKey(provider) || provider === "claude-bridge");
+      const hasNative = canUseNativeSearch(provider);
       onUpdate?.({
+        details: {},
         content: [
           {
             type: "text" as const,
@@ -853,31 +830,35 @@ export default function searchExtension(pi: ExtensionAPI) {
         ],
       });
       try {
-        const { text, nativeError } = await doSearch(
+        const { text, sources, apiSources = [], nativeError } = await doSearch(
           params.query,
           provider,
           model,
           baseUrl,
+          ctx,
           signal,
         );
+        const method = hasNative && !nativeError ? "native" : "ddg";
         const out = nativeError
           ? `> Native failed (${nativeError.slice(0, 80)}), used DuckDuckGo.\n\n${text}`
-          : text;
+          : provider === "openai-codex" && method === "native" && !sources.length && !apiSources.length
+            ? `> No structured source metadata was supplied by the provider.\n\n${text}`
+            : text;
         return {
-          content: [{ type: "text" as const, text: out }],
+          content: [{ type: "text" as const, text: formatSearchResult({ text: out, sources, apiSources }) }],
           details: {
             query: params.query,
+            sources,
+            apiSources,
             provider,
-            method: hasNative && !nativeError ? "native" : "ddg",
+            method,
+            // Retain the attempted model on fallback, but never label DDG as an LLM.
+            ...(hasNative && model.id ? { searchModel: model.id, searchModelSource: model.source } : {}),
           },
         };
-      } catch (err: any) {
-        if (signal?.aborted)
-          return { content: [{ type: "text" as const, text: "Cancelled." }] };
-        return {
-          content: [{ type: "text" as const, text: `Error: ${err.message}` }],
-          isError: true,
-        };
+      } catch (err) {
+        signal?.throwIfAborted();
+        throw err; // Pi marks thrown tool errors as isError.
       }
     },
     renderCall(a, t) {
@@ -887,17 +868,20 @@ export default function searchExtension(pi: ExtensionAPI) {
         0,
       );
     },
-    renderResult(r, { expanded, isPartial }, t) {
+    renderResult(r, { expanded, isPartial }, t, context) {
       if (isPartial) return new Text(t.fg("warning", "Searching..."), 0, 0);
-      const text = r.content[0]?.text ?? "",
-        lines = text.split("\n").length;
-      return expanded
-        ? new Text(text, 0, 0)
-        : new Text(
-            t.fg("success", "Found results") + t.fg("dim", ` (${lines} lines)`),
-            0,
-            0,
-          );
+      const text = r.content[0]?.type === "text" ? r.content[0].text : "";
+      if (expanded) return new Text(text, 0, 0);
+      if (context?.isError || r.details?.error) return new Text(t.fg("error", text || "Search failed"), 0, 0);
+      const urls = r.details?.sources?.length ?? 0;
+      const apis = r.details?.apiSources?.length ?? 0;
+      const status = urls || apis
+        ? `Found results (${urls} URL, ${apis} API sources)`
+        : "Results returned — no structured source metadata";
+      return new Text(
+        t.fg(urls || apis ? "success" : "warning", status)
+          + t.fg("dim", ` (${text.split("\n").length} lines)`), 0, 0,
+      );
     },
   });
 
@@ -908,11 +892,12 @@ export default function searchExtension(pi: ExtensionAPI) {
     parameters: Type.Object({ url: Type.String({ description: "URL" }) }),
     async execute(_id, params, signal, onUpdate, ctx) {
       if (!isFetchAvailable(ctx, config))
-        return { content: [{ type: "text" as const, text: "Web fetch disabled." }] };
+        return { content: [{ type: "text" as const, text: "Web fetch disabled." }], details: { error: "disabled" } };
       const provider = getCurrentProvider(ctx) ?? "";
       const cap = PROVIDERS[provider];
       const useNative = !!cap?.nativeFetch && provider === "claude-bridge";
       onUpdate?.({
+        details: {},
         content: [
           {
             type: "text" as const,
@@ -944,13 +929,9 @@ export default function searchExtension(pi: ExtensionAPI) {
             method: useNative && !nativeError ? "native" : "local",
           },
         };
-      } catch (err: any) {
-        if (signal?.aborted)
-          return { content: [{ type: "text" as const, text: "Cancelled." }] };
-        return {
-          content: [{ type: "text" as const, text: `Error: ${err.message}` }],
-          isError: true,
-        };
+      } catch (err) {
+        signal?.throwIfAborted();
+        throw err;
       }
     },
     renderCall(a, t) {
@@ -962,7 +943,7 @@ export default function searchExtension(pi: ExtensionAPI) {
     },
     renderResult(r, { expanded, isPartial }, t) {
       if (isPartial) return new Text(t.fg("warning", "Fetching..."), 0, 0);
-      const text = r.content[0]?.text ?? "",
+      const text = r.content[0]?.type === "text" ? r.content[0].text : "",
         lines = text.split("\n").length;
       return expanded
         ? new Text(text, 0, 0)
@@ -1042,7 +1023,7 @@ export default function searchExtension(pi: ExtensionAPI) {
 
       const currentProvider = getCurrentProvider(ctx);
       for (const pid of Object.keys(PROVIDERS).sort()) {
-        if (!hasCredentials(pid) && pid !== currentProvider) continue;
+        if (!hasCredentials(pid, ctx) && pid !== currentProvider) continue;
         const cap = PROVIDERS[pid]!;
         const override = config.providerOverrides[pid];
         const native = cap.nativeSearch ? " [native]" : "";
@@ -1108,19 +1089,18 @@ export default function searchExtension(pi: ExtensionAPI) {
 
   async function showProviders(ctx: ExtensionContext) {
     const currentProvider = getCurrentProvider(ctx);
-    const currentModel = getCurrentModel(ctx);
     const items: SelectItem[] = Object.entries(PROVIDERS)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([id, cap]) => ({
         value: id,
-        label: `${cap.name}${id === currentProvider ? " ← current" : ""}${hasCredentials(id) ? " ✓" : ""}`,
-        description: `search: ${cap.nativeSearch ? `native (${id === "zai" ? "MCP" : id === "anthropic" ? "web_search server tool" : `model: ${id === currentProvider ? currentModel : "?"}`})` : "duckduckgo"} | key: ${hasCredentials(id) ? "yes" : "no"}`,
+        label: `${cap.name}${id === currentProvider ? " ← current" : ""}${hasCredentials(id, ctx) ? " ✓" : ""}`,
+        description: `search: ${cap.nativeSearch ? `native (${id === "zai" ? "MCP" : `model: ${describeSearchModel(getSearchModel(id, ctx, config))}`})` : "duckduckgo"} | auth: ${hasCredentials(id, ctx) ? "yes" : "no"}`,
       }));
 
     await ctx.ui.custom((tui, theme, _kb, done) => {
       const container = new Container();
       container.addChild(new Text(theme.fg("accent", theme.bold("All Providers"))));
-      container.addChild(new Text(theme.fg("dim", "✓ = has API key")));
+      container.addChild(new Text(theme.fg("dim", "✓ = has credentials (API key or subscription)")));
       container.addChild(new Text(""));
       const sl = new SelectList(items, Math.min(items.length, 15), {
         selectedPrefix: (t) => theme.fg("accent", t),
@@ -1153,15 +1133,18 @@ export default function searchExtension(pi: ExtensionAPI) {
     const model = getCurrentModel(ctx);
     const baseUrl = getCurrentBaseUrl(ctx);
     const cap = provider ? PROVIDERS[provider] : undefined;
+    const native = canUseNativeSearch(provider ?? "");
     ctx.ui.notify(
       [
         `Extension: ${config.enabled ? "enabled" : "disabled"}`,
         `Search: ${config.searchEnabled ? "enabled" : "disabled"} | Fetch: ${config.fetchEnabled ? "enabled" : "disabled"}`,
         ``,
-        `Provider: ${cap?.name ?? provider ?? "?"} ${hasCredentials(provider ?? "") ? "✓" : "✗"}`,
-        `Model: ${model || "?"}`,
-        `Base URL: ${baseUrl || "?"}`,
-        `Native: ${cap?.nativeSearch ? `yes` : "no"} | Fallback: DuckDuckGo`,
+        `Provider: ${cap?.name ?? provider ?? "?"} ${hasCredentials(provider ?? "", ctx) ? "✓" : "✗"}`,
+        `Session model: ${model || "?"}`,
+        `Search backend: ${native ? provider === "zai" ? "ZAI MCP" : "native LLM" : "DuckDuckGo"}`,
+        `Search model: ${native ? describeSearchModel(getSearchModel(provider ?? "", ctx, config)) : "not applicable (DuckDuckGo)"}`,
+        `Session base URL: ${baseUrl || "?"}`,
+        `Native: ${native ? "yes" : "no"} | Fallback: DuckDuckGo`,
       ].join("\n"),
       "info",
     );
@@ -1184,14 +1167,14 @@ export default function searchExtension(pi: ExtensionAPI) {
       return;
     }
     const p = getCurrentProvider(ctx);
-    const model = getCurrentModel(ctx);
+    const model = getSearchModel(p ?? "", ctx, config);
     const cap = p ? PROVIDERS[p] : undefined;
     const m =
-      cap?.nativeSearch && hasCredentials(p ?? "")
-        ? `native:${p === "zai" ? "mcp" : p === "claude-bridge" ? "cc-sdk" : model || "?"}`
+      canUseNativeSearch(p ?? "")
+        ? `native:${p === "zai" ? "mcp" : describeSearchModel(model)}`
         : "ddg";
     const fetchBackend =
-      cap?.nativeFetch && hasCredentials(p ?? "") && p === "claude-bridge"
+      cap?.nativeFetch && hasCredentials(p ?? "", ctx) && p === "claude-bridge"
         ? "fetch:cc-sdk"
         : "fetch";
     const parts: string[] = [];

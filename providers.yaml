@@ -19,6 +19,13 @@ providers:
     # Uses web_search tool via OpenAI Responses API
     search_type: "openai_web_search"
 
+  openai-codex:
+    name: "OpenAI ChatGPT (subscription)"
+    native_search: true
+    native_fetch: false
+    # Pi's existing ChatGPT OAuth login; separate from OPENAI_API_KEY.
+    search_type: "codex_responses_web_search"
+
   openrouter:
     name: "OpenRouter"
     native_search: true

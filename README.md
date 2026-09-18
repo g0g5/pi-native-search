@@ -1,5 +1,10 @@
 # pi-native-search
 
+> **Local ChatGPT fork:** Adds `openai-codex` (OpenAI ChatGPT subscription) search,
+> reusing Pi's OAuth login and token refresh. Targets Pi `@earendil-works/*` 0.85.1+.
+> See [LOCAL-FORK.md](LOCAL-FORK.md) for local installation, tests, and rollback.
+> The npm install command below installs upstream, **not this fork**.
+
 [![npm version](https://img.shields.io/npm/v/pi-native-search)](https://www.npmjs.com/package/pi-native-search)
 [![license](https://img.shields.io/npm/l/pi-native-search)](LICENSE)
 
@@ -18,6 +23,7 @@ Pi ships with provider plumbing but no built-in search. Most extensions either (
 | **anthropic** | `web_search_20250305` server tool | `ANTHROPIC_API_KEY` |
 | **google** (Gemini) | `google_search` grounding tool | `GEMINI_API_KEY` |
 | **openai** | Responses API `web_search` tool | `OPENAI_API_KEY` |
+| **openai-codex** (OpenAI ChatGPT subscription) | Codex Responses `web_search` tool | Pi's `/login openai-codex` OAuth credentials (auto-refreshed) |
 | **xai** (Grok) | Responses API `web_search` tool | `XAI_API_KEY` |
 | All other providers | DuckDuckGo HTML fallback | none |
 
@@ -51,35 +57,116 @@ The model decides when to use them; you don't need to do anything else. To confi
 The bottom status bar shows the active backend per call, e.g.:
 
 ```
-search[search:native:cc-sdk,fetch:cc-sdk]    # claude-bridge route
+search[search:native:SDK default,fetch:cc-sdk] # claude-bridge route
 search[search:native:mcp,fetch]               # ZAI route
 search[search:ddg,fetch]                      # DDG fallback
 ```
 
-Configuration persists in `~/.pi/agent/search-config.json`.
+Configuration persists in `~/.pi/agent/search-config.json` (under `getAgentDir()` if the agent directory is customized).
 
-## How it works
+### Per-provider search models
 
-The dispatcher in `doSearch` (and the `web_fetch` handler) reads the active provider from the extension context and selects a backend:
+Add `model` to an existing provider override to use a different model for search,
+without changing the active provider or the conversation model:
 
-```ts
-async function doSearch(query, provider, model, baseUrl, signal) {
-  const cap = PROVIDERS[provider];
-  if (cap?.nativeSearch && hasAuth) {
-    switch (provider) {
-      case "zai":           return zaiSearch(query, apiKey, signal);
-      case "google":        return googleSearch(query, model, apiKey, signal);
-      case "openai":        return openaiSearch(query, model, apiKey, signal);
-      case "xai":           return xaiSearch(query, model, apiKey, signal);
-      case "anthropic":     return anthropicSearch(query, model, apiKey, baseUrl, signal);
-      case "claude-bridge": return claudeBridgeSearch(query, signal);
-    }
+```json
+{
+  "enabled": true,
+  "searchEnabled": true,
+  "fetchEnabled": true,
+  "providerOverrides": {
+    "openai-codex": { "model": "YOUR_CODEX_MODEL_ID" },
+    "google": { "searchEnabled": true, "model": "YOUR_GEMINI_MODEL_ID" }
   }
-  return ddgSearch(query, signal); // fallback
 }
 ```
 
-If the native call throws, the result is silently swapped for the DDG fallback with a `> Native failed (...)` prefix so you can see what went wrong without losing the search result.
+- Supported LLM search backends: `google`, `openai`, `openai-codex`, `xai`,
+  `anthropic`, and `claude-bridge`.
+- ZAI Web Search Prime MCP and DuckDuckGo (including other providers routed to
+  DuckDuckGo) **ignore** `model`. This field does not enable a new native backend.
+- Missing, empty/whitespace-only, or non-string values preserve the default:
+  the current session model for API/Codex backends, or the SDK default for
+  Claude Bridge. Leading/trailing whitespace is trimmed.
+- Only the active provider's entry is used. `web_fetch` is unaffected.
+- `openai-codex` requires an exact model ID registered in Pi's model catalog.
+  Authentication, headers, and base URL are resolved for that target model.
+  Other API backends accept model IDs directly and keep their existing endpoint
+  and credential behavior; Claude Bridge passes the ID to its SDK.
+- Unknown Codex models or rejected native requests produce the existing explicit
+  DuckDuckGo fallback warning. There is no retry with the conversation model;
+  cancellation does not initiate fallback.
+- After editing, run `/reload`. `/search config` distinguishes the session model
+  from the search model; the provider list and status bar identify configured
+  versus default models. Search result `details.searchModel` and
+  `details.searchModelSource` record the selected native LLM model, including on
+  fallback (`details.method` remains `ddg`). SDK-default and non-LLM searches omit
+  these fields. Settings toggles preserve the model override.
+
+### Structured search sources
+
+Successful `web_search` results now include `details.sources: { title: string;
+url: string }[]` and `details.apiSources: { type: "api"; name: string }[]`.
+Existing query, provider, method, and search-model fields are unchanged. For example:
+
+```json
+{
+  "query": "Pi documentation",
+  "provider": "openai-codex",
+  "method": "native",
+  "sources": [{ "title": "Pi", "url": "https://pi.dev/" }],
+  "apiSources": []
+}
+```
+
+| Native LLM backend | Source metadata used |
+|---|---|
+| `openai`, `openai-codex` | URL citations from all answer blocks, then `web_search_call.action.sources` |
+| `xai` | URL citations from all answer blocks, then top-level `citations` |
+| `google` | Selected candidate's `groundingMetadata.groundingChunks[].web` |
+| `anthropic` | Text citations, then `web_search_tool_result` hits |
+
+Sources are provider-supplied citations/search hits, not URLs guessed from answer
+text, and not necessarily all cited in the answer. They are deduplicated by exact
+URL, with cited sources first. HTTP/HTTPS URLs keep their query strings (including
+Google grounding redirect URLs); missing titles fall back to the hostname. xAI's
+numeric citation titles also fall back to the hostname.
+
+- Metadata retains at most 64 sources and 32 KiB of serialized source data. URLs
+  over 4096 UTF-8 bytes are omitted rather than shortened; titles are capped at
+  512 UTF-8 bytes. Invalid URLs and malformed optional source entries are ignored.
+- Responses search can also return API sources, e.g. `{ "type": "api", "name":
+  "oai-weather" }` for weather queries, without URL citations. These are retained
+  separately in `apiSources`, never converted to guessed URLs or vendor names.
+  API metadata is deduplicated by cleaned name and limited to 16 entries / 4 KiB;
+  blank, non-string or over-256-UTF-8-byte names and unknown source types are ignored.
+- Model-visible text includes a Markdown `## Sources:` section, showing up to 8
+  retained sources total within a 16 KiB display budget. API sources are displayed
+  first with an explicit notice that the provider supplied no accessible URL.
+  More sources remain in `details.sources` / `details.apiSources`; an omission
+  notice identifies the displayed count.
+- The complete text output, including Sources and truncation notices, stays within
+  50 KiB / 2000 lines. Space is reserved for sources before truncating the answer.
+- `sources: []` means no retained URL sources, not necessarily no provenance or
+  results: check `apiSources` too. Codex answers with neither type include a
+  model-visible missing-metadata notice; API-only answers remain native successes.
+  Collapsed tool output shows URL/API source counts, or a missing-metadata warning
+  (also for historical results lacking source fields).
+  Claude Bridge, ZAI and DuckDuckGo keep their existing text output and return
+  both arrays empty; their text links are not parsed into metadata.
+- Native failure discards any partial sources before DuckDuckGo fallback.
+  Anthropic server-tool errors also trigger fallback. `web_fetch` is unchanged.
+
+## How it works
+
+`doSearch` in `extensions/index.ts` selects the backend from the active provider,
+credentials, and search-model selection. It returns `{ text, sources, apiSources?, nativeError? }`.
+The parsers and shared formatter in `extensions/search-result.ts` keep source
+extraction separate from presentation. The registered tool exposes the sources in
+`details` and formats/truncates the model-visible text once at the output boundary.
+
+If the native call throws, the result is replaced by the DDG fallback with a
+`> Native failed (...)` prefix. Cancellation propagates without starting fallback.
 
 ### claude-bridge specifics
 
@@ -107,12 +194,14 @@ foo: {
 **2. Implement the search function**:
 
 ```ts
+import { normalizeSources, type SearchResult } from "./search-result.ts";
+
 async function fooSearch(
   query: string,
   model: string,
   apiKey: string,
   signal?: AbortSignal,
-): Promise<string> {
+): Promise<SearchResult> {
   const res = await fetch("https://api.foo.com/search", {
     method: "POST",
     signal,
@@ -125,13 +214,11 @@ async function fooSearch(
   if (!res.ok)
     throw new Error(`Foo ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const data = (await res.json()) as any;
-  // Format as numbered list with title, url, snippet
-  return data.results
-    .map(
-      (r: any, i: number) =>
-        `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.snippet}`,
-    )
-    .join("\n\n");
+  // Extract provider metadata; the tool boundary formats the Sources section.
+  return {
+    text: data.text || "",
+    sources: normalizeSources(data.results || []),
+  };
 }
 ```
 
@@ -139,30 +226,33 @@ async function fooSearch(
 
 ```ts
 case "foo":
-  return { text: await fooSearch(query, model, apiKey, signal) };
+  return await fooSearch(query, model, apiKey, signal);
 ```
 
-That's it. The settings UI, status line, and fallback handling all pick it up automatically from the `PROVIDERS` map.
+For an LLM search backend, also add its provider ID to `LLM_SEARCH_PROVIDERS` in
+`extensions/search-model.ts` to enable model overrides. Leave non-LLM search
+backends out of that set. The settings UI and fallback handling use `PROVIDERS`.
 
-If the provider doesn't use a standard `Bearer` API key (e.g. OAuth, MCP session, or an SDK that handles auth itself like `claude-bridge`), see `claudeBridgeSearch` for how to special-case the auth check in `hasCredentials` and the `hasAuth` gate in `doSearch`.
+If the provider doesn't use a standard `Bearer` API key (e.g. OAuth, MCP session, or an SDK that handles auth itself like `claude-bridge`), see `claudeBridgeSearch` for how to special-case the auth check in `hasCredentials` and `canUseNativeSearch`.
 
 ## Development
 
 ```bash
 git clone https://github.com/smalibary/pi-native-search.git
 cd pi-native-search
-# Edit extensions/index.ts, then test by symlinking into pi:
-cp extensions/index.ts ~/.pi/agent/extensions/pi-native-search/index.ts
-# In pi: /reload
+npm test
+# Install the local package as described in LOCAL-FORK.md, then in pi: /reload
 ```
 
-The extension is a single TypeScript file (`extensions/index.ts`) that pi loads via `tsx` at runtime — no build step required.
+Pi loads `extensions/index.ts` and its helper modules at runtime — no build step required.
 
 ## License
 
 MIT — see [LICENSE](LICENSE). PRs welcome, especially for new provider backends.
 
 ## Acknowledgements
+
+- [opencode-websearch](https://github.com/emilsvennesson/opencode-websearch) — reference for structured source extraction, URL deduplication and xAI citation handling (reviewed at `775eac4`)
 
 - [pi](https://github.com/badlogic/pi-mono) by Mario Zechner — the host TUI agent
 - [pi-claude-bridge](https://github.com/elidickinson/pi-claude-bridge) by Eli Dickinson — provides the Claude Agent SDK that `claude-bridge` mode reuses

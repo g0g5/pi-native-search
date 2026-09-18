@@ -1,6 +1,6 @@
 {
   "name": "pi-native-search",
-  "version": "0.1.0",
+  "version": "0.1.0-chatgpt.1",
   "private": false,
   "description": "Pi extension that adds web_search and web_fetch tools using each provider's native search backend (ZAI MCP, Anthropic, Google, OpenAI, xAI, Claude Code subscription via claude-bridge), with DuckDuckGo as a universal fallback.",
   "keywords": [
@@ -25,23 +25,31 @@
     "url": "https://github.com/smalibary/pi-native-search/issues"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.18.1"
   },
   "type": "module",
   "files": [
     "extensions",
     "README.md",
+    "LOCAL-FORK.md",
     "LICENSE"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": ">=0.85.1",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "peerDependenciesMeta": {
     "pi-claude-bridge": {
       "optional": true
     }
+  },
+  "dependencies": {
+    "undici": "^7.16.0"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:live": "node --experimental-strip-types tests/live-chatgpt.ts"
   },
   "pi": {
     "extensions": [
