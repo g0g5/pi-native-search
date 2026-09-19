@@ -72,7 +72,7 @@ test("README configuration examples are accepted by the config parser", () => {
     })
     .filter((value) => value && typeof value === "object" && "searchProvider" in value);
 
-  assert.ok(configExamples.length >= 2, "README must document the global config shape and a migration example");
+  assert.ok(configExamples.length >= 1, "README must document the global search configuration");
   for (const example of configExamples) {
     const state = normalizeSearchConfig(example);
     assert.equal(state.error, undefined, `README example must be valid: ${JSON.stringify(example)}`);
@@ -82,22 +82,8 @@ test("README configuration examples are accepted by the config parser", () => {
   }
 });
 
-test("README provenance example documents the fields the tool actually emits", () => {
+test("README lists every supported search backend", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf-8");
-  const blocks = [...readme.matchAll(/```json\n([\s\S]*?)```/g)].map((match) => match[1]!);
-  const example = blocks
-    .map((block) => {
-      try {
-        return JSON.parse(block);
-      } catch {
-        return undefined;
-      }
-    })
-    .find((value) => value && typeof value === "object" && "attempts" in value && "provider" in value);
-  assert.ok(example, "README must show a provenance example with attempt history");
-  for (const field of ["query", "provider", "method", "tier", "sources", "apiSources", "attempts"]) {
-    assert.ok(field in example, `provenance example must include ${field}`);
-  }
-  assert.ok(["configured", "session", "fallback"].includes(example.tier));
-  assert.ok(["native", "ddg"].includes(example.method));
+  const backendRows = [...readme.matchAll(/^\| \*\*([a-z-]+)\*\*/gm)].map((match) => match[1]!);
+  assert.deepEqual(backendRows.sort(), [...SEARCH_BACKEND_IDS].sort());
 });

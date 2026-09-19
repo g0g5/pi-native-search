@@ -31,7 +31,6 @@
   "files": [
     "extensions",
     "README.md",
-    "LOCAL-FORK.md",
     "LICENSE"
   ],
   "peerDependencies": {

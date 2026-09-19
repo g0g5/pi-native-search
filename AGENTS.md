@@ -12,8 +12,7 @@ Pi extension (`pi-native-search`) that adds `web_search` and `web_fetch` tools r
 pi-native-search/
 |- package.json            # Manifest, scripts, and `pi.extensions` → ./extensions/index.ts
 |- providers.yaml          # Documentation mirror of the runtime backend registry (not read at runtime; kept in sync by providers-doc.test.ts)
-|- README.md               # Usage/architecture docs: routing priority, config, web_fetch, adding a backend
-|- LOCAL-FORK.md           # Fork rationale, config/migration, install and rollback steps, changed-file list
+|- README.md               # User guide: fork overview, installation, backends, config, migration/rollback, and tests
 |- extensions/
 |  |- index.ts             # Entrypoint: search dispatch with tiered fallback, /search settings UI, web_search/web_fetch registration
 |  |- search-providers.ts  # SEARCH_BACKENDS registry — backend ids, kind (llm/non-llm), auth mode, env var key
